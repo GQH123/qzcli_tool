@@ -479,6 +479,83 @@ class QzAPI:
         
         return result.get("data", {})
 
+    def list_task_dimension(
+        self,
+        workspace_id: str,
+        cookie: str,
+        project_id: Optional[str] = None,
+        page_num: int = 1,
+        page_size: int = 200,
+    ) -> Dict[str, Any]:
+        """
+        获取任务维度的资源使用情况（使用浏览器 cookie 认证）
+        
+        Args:
+            workspace_id: 工作空间 ID
+            cookie: 浏览器 cookie 字符串
+            project_id: 项目 ID（可选）
+            page_num: 页码
+            page_size: 每页数量
+            
+        Returns:
+            包含 task_dimensions 列表的字典
+        """
+        url = f"{self.base_url}/api/v1/cluster_metric/list_task_dimension"
+        
+        filter_params = {"workspace_id": workspace_id}
+        if project_id:
+            filter_params["project_id"] = project_id
+        
+        payload = {
+            "page_num": page_num,
+            "page_size": page_size,
+            "filter": filter_params,
+        }
+        
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "en-US,en;q=0.9",
+            "cache-control": "no-cache",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": "https://qz.sii.edu.cn",
+            "pragma": "no-cache",
+            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        }
+        
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+        
+        if response.status_code == 401:
+            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        
+        if response.status_code != 200:
+            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
+        
+        try:
+            result = response.json()
+        except Exception:
+            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
+        
+        if result.get("code") != 0:
+            raise QzAPIError(
+                f"API 请求失败: {result.get('message', '未知错误')}",
+                result.get("code")
+            )
+        
+        return result.get("data", {})
+
     def login_with_cas(self, username: str, password: str) -> str:
         """
         通过 CAS 统一认证登录，获取 session cookie

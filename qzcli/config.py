@@ -327,3 +327,117 @@ def list_cached_workspaces() -> List[Dict[str, Any]]:
         })
     
     return result
+
+
+def update_workspace_projects(workspace_id: str, projects: List[Dict[str, Any]], name: str = "") -> int:
+    """
+    增量更新工作空间的项目列表
+    
+    Args:
+        workspace_id: 工作空间 ID
+        projects: 项目列表 [{"id": ..., "name": ...}, ...]
+        name: 工作空间名称（可选）
+        
+    Returns:
+        新增的项目数量
+    """
+    ensure_config_dir()
+    
+    import time
+    
+    # 读取现有缓存
+    all_resources = load_all_resources()
+    
+    # 获取或创建该工作空间的条目
+    if workspace_id not in all_resources:
+        all_resources[workspace_id] = {
+            "id": workspace_id,
+            "name": name,
+            "projects": {},
+            "compute_groups": {},
+            "specs": {},
+            "updated_at": time.time(),
+        }
+    
+    ws_data = all_resources[workspace_id]
+    existing_projects = ws_data.get("projects", {})
+    
+    # 更新名称（如果提供）
+    if name:
+        ws_data["name"] = name
+    
+    # 增量更新项目
+    new_count = 0
+    for proj in projects:
+        proj_id = proj.get("id", "")
+        if proj_id and proj_id not in existing_projects:
+            existing_projects[proj_id] = proj
+            new_count += 1
+        elif proj_id:
+            # 更新已有项目的名称（可能有变化）
+            existing_projects[proj_id].update(proj)
+    
+    ws_data["projects"] = existing_projects
+    ws_data["updated_at"] = time.time()
+    
+    with open(RESOURCES_FILE, "w", encoding="utf-8") as f:
+        json.dump(all_resources, f, indent=2, ensure_ascii=False)
+    
+    return new_count
+
+
+def update_workspace_compute_groups(workspace_id: str, compute_groups: List[Dict[str, Any]], name: str = "") -> int:
+    """
+    增量更新工作空间的计算组列表
+    
+    Args:
+        workspace_id: 工作空间 ID
+        compute_groups: 计算组列表 [{"id": ..., "name": ..., "gpu_type": ...}, ...]
+        name: 工作空间名称（可选）
+        
+    Returns:
+        新增的计算组数量
+    """
+    ensure_config_dir()
+    
+    import time
+    
+    # 读取现有缓存
+    all_resources = load_all_resources()
+    
+    # 获取或创建该工作空间的条目
+    if workspace_id not in all_resources:
+        all_resources[workspace_id] = {
+            "id": workspace_id,
+            "name": name,
+            "projects": {},
+            "compute_groups": {},
+            "specs": {},
+            "updated_at": time.time(),
+        }
+    
+    ws_data = all_resources[workspace_id]
+    existing_groups = ws_data.get("compute_groups", {})
+    
+    # 更新名称（如果提供）
+    if name:
+        ws_data["name"] = name
+    
+    # 增量更新计算组
+    new_count = 0
+    for group in compute_groups:
+        group_id = group.get("id", "")
+        if group_id and group_id not in existing_groups:
+            existing_groups[group_id] = group
+            new_count += 1
+        elif group_id:
+            # 更新已有计算组的信息（可能有变化）
+            existing_groups[group_id].update(group)
+    
+    ws_data["compute_groups"] = existing_groups
+    ws_data["updated_at"] = time.time()
+    
+    with open(RESOURCES_FILE, "w", encoding="utf-8") as f:
+        json.dump(all_resources, f, indent=2, ensure_ascii=False)
+    
+    return new_count

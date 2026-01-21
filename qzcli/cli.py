@@ -15,7 +15,7 @@ from .config import (
     save_cookie, get_cookie, clear_cookie,
     save_resources, get_workspace_resources, load_all_resources,
     set_workspace_name, find_workspace_by_name, find_resource_by_name,
-    list_cached_workspaces,
+    list_cached_workspaces, update_workspace_projects, update_workspace_compute_groups,
 )
 from .api import get_api, QzAPIError
 from .store import get_store, JobRecord
@@ -796,12 +796,25 @@ def cmd_avail(args):
                     nodes = data.get("node_dimensions", [])
                     total_nodes = len(nodes)
                     
-                    # 统计空闲节点（GPU 使用数为 0）
+                    # 统计空闲节点（GPU 使用数为 0）和空闲 GPU 分布
                     free_nodes = []
+                    gpu_free_distribution = {}  # free_gpu_count -> node_count
+                    total_free_gpus = 0
+                    total_gpus = 0
+                    
                     for node in nodes:
                         gpu_info = node.get("gpu", {})
                         gpu_used = gpu_info.get("used", 0)
                         gpu_total = gpu_info.get("total", 0)
+                        gpu_free = gpu_total - gpu_used
+                        
+                        total_gpus += gpu_total
+                        total_free_gpus += gpu_free
+                        
+                        # 统计空闲 GPU 分布
+                        if gpu_free > 0:
+                            gpu_free_distribution[gpu_free] = gpu_free_distribution.get(gpu_free, 0) + 1
+                        
                         if gpu_used == 0 and gpu_total > 0:
                             free_nodes.append({
                                 "name": node.get("name", ""),
@@ -817,6 +830,9 @@ def cmd_avail(args):
                         "total_nodes": total_nodes,
                         "free_nodes": len(free_nodes),
                         "free_node_list": free_nodes,
+                        "total_gpus": total_gpus,
+                        "total_free_gpus": total_free_gpus,
+                        "gpu_free_distribution": gpu_free_distribution,
                         "specs": specs,
                     })
                 except QzAPIError as e:
@@ -879,15 +895,25 @@ def cmd_avail(args):
         for ws_name, results in by_workspace.items():
             results.sort(key=lambda x: x["free_nodes"], reverse=True)
             display.print(f"[bold]{ws_name}[/bold]")
-            display.print(f"{'  计算组':<27} {'空节点':>6} {'总节点':>6} {'GPU类型':<10}")
-            display.print("  " + "-" * 53)
+            display.print(f"{'  计算组':<27} {'空节点':>6} {'总节点':>6} {'空GPU':>8} {'GPU类型':<10}")
+            display.print("  " + "-" * 65)
             for r in results:
                 name_display = r['name'][:23] if len(r['name']) > 23 else r['name']
-                display.print(f"  {name_display:<25} {r['free_nodes']:>6} {r['total_nodes']:>6} {r['gpu_type']:<10}")
-                # 显示空闲节点列表
-                if args.verbose and r.get('free_node_list'):
-                    node_names = [n['name'] for n in r['free_node_list']]
-                    display.print(f"    [dim]空闲: {', '.join(node_names)}[/dim]")
+                free_gpu_str = f"{r.get('total_free_gpus', 0)}/{r.get('total_gpus', 0)}"
+                display.print(f"  {name_display:<25} {r['free_nodes']:>6} {r['total_nodes']:>6} {free_gpu_str:>8} {r['gpu_type']:<10}")
+                
+                # 显示空闲 GPU 分布（-v 模式）
+                if args.verbose:
+                    dist = r.get('gpu_free_distribution', {})
+                    if dist:
+                        dist_parts = []
+                        for gpu_count in sorted(dist.keys(), reverse=True):
+                            node_count = dist[gpu_count]
+                            dist_parts.append(f"空{gpu_count}卡×{node_count}")
+                        display.print(f"    [dim]{', '.join(dist_parts)}[/dim]")
+                    if r.get('free_node_list'):
+                        node_names = [n['name'] for n in r['free_node_list']]
+                        display.print(f"    [dim]全空节点: {', '.join(node_names)}[/dim]")
             display.print("")
         
         # 导出格式
@@ -898,6 +924,192 @@ def cmd_avail(args):
                     display.print(f"# [{r['workspace_name']}] {r['name']} ({r['free_nodes']} 空节点)")
                     display.print(f'WORKSPACE_ID="{r["workspace_id"]}"')
                     display.print(f'LOGIC_COMPUTE_GROUP_ID="{r["id"]}"')
+    
+    return 0
+
+
+def cmd_usage(args):
+    """统计工作空间的 GPU 使用分布"""
+    display = get_display()
+    api = get_api()
+    
+    # 获取 cookie
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        display.print_error("未设置 cookie，请先运行: qzcli login")
+        return 1
+    
+    cookie = cookie_data["cookie"]
+    
+    # 解析 workspace 参数
+    workspace_input = args.workspace
+    
+    if not workspace_input:
+        # 查询所有已缓存的工作空间
+        all_resources = load_all_resources()
+        if not all_resources:
+            display.print_error("没有已缓存的工作空间")
+            display.print("[dim]请先运行: qzcli res -u[/dim]")
+            return 1
+        workspace_ids = [(ws_id, data.get("name", "")) for ws_id, data in all_resources.items()]
+    elif workspace_input.startswith("ws-"):
+        ws_resources = get_workspace_resources(workspace_input)
+        ws_name = ws_resources.get("name", "") if ws_resources else ""
+        workspace_ids = [(workspace_input, ws_name)]
+    else:
+        workspace_id = find_workspace_by_name(workspace_input)
+        if workspace_id:
+            ws_resources = get_workspace_resources(workspace_id)
+            ws_name = ws_resources.get("name", "") if ws_resources else workspace_input
+            workspace_ids = [(workspace_id, ws_name)]
+        else:
+            display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
+            return 1
+    
+    from collections import defaultdict
+    
+    all_stats = []
+    
+    for workspace_id, ws_name in workspace_ids:
+        display.print(f"[dim]正在查询 {ws_name or workspace_id}...[/dim]")
+        
+        try:
+            data = api.list_task_dimension(workspace_id, cookie, page_size=500)
+            tasks = data.get("task_dimensions", [])
+            
+            if not tasks:
+                continue
+            
+            # 统计 GPU 分布
+            gpu_distribution = defaultdict(int)  # gpu_count -> task_count
+            user_gpu = defaultdict(int)  # user -> total_gpu
+            project_gpu = defaultdict(int)  # project -> total_gpu
+            total_gpu = 0
+            total_tasks = len(tasks)
+            
+            # 提取项目信息用于更新 resources.json
+            projects_found = {}
+            
+            for task in tasks:
+                gpu_info = task.get("gpu", {})
+                gpu_total = gpu_info.get("total", 0)
+                user_name = task.get("user", {}).get("name", "未知")
+                project_info = task.get("project", {})
+                project_name = project_info.get("name", "未知")
+                project_id = project_info.get("id", "")
+                
+                # 收集项目信息
+                if project_id and project_id not in projects_found:
+                    projects_found[project_id] = {
+                        "id": project_id,
+                        "name": project_name,
+                    }
+                
+                gpu_distribution[gpu_total] += 1
+                user_gpu[user_name] += gpu_total
+                project_gpu[project_name] += gpu_total
+                total_gpu += gpu_total
+            
+            # 增量更新 resources.json 中的项目列表
+            if projects_found:
+                new_count = update_workspace_projects(
+                    workspace_id, 
+                    list(projects_found.values()),
+                    ws_name
+                )
+                if new_count > 0:
+                    display.print(f"[dim]发现 {new_count} 个新项目，已更新到本地缓存[/dim]")
+            
+            # 通过 list_node_dimension 发现计算组
+            try:
+                node_data = api.list_node_dimension(workspace_id, cookie, page_size=500)
+                nodes = node_data.get("node_dimensions", [])
+                
+                # 从节点信息中提取计算组
+                compute_groups_found = {}
+                for node in nodes:
+                    lcg_info = node.get("logic_compute_group", {})
+                    lcg_id = lcg_info.get("id", "")
+                    lcg_name = lcg_info.get("name", "")
+                    if lcg_id and lcg_id not in compute_groups_found:
+                        # 获取 GPU 类型信息
+                        gpu_info = node.get("gpu", {})
+                        gpu_type = gpu_info.get("type", "")
+                        compute_groups_found[lcg_id] = {
+                            "id": lcg_id,
+                            "name": lcg_name,
+                            "gpu_type": gpu_type,
+                            "workspace_id": workspace_id,
+                        }
+                
+                if compute_groups_found:
+                    new_cg_count = update_workspace_compute_groups(
+                        workspace_id,
+                        list(compute_groups_found.values()),
+                        ws_name
+                    )
+                    if new_cg_count > 0:
+                        display.print(f"[dim]发现 {new_cg_count} 个新计算组，已更新到本地缓存[/dim]")
+            except QzAPIError:
+                pass  # 忽略节点查询失败，不影响主要功能
+            
+            all_stats.append({
+                "workspace_id": workspace_id,
+                "workspace_name": ws_name,
+                "total_tasks": total_tasks,
+                "total_gpu": total_gpu,
+                "gpu_distribution": dict(gpu_distribution),
+                "user_gpu": dict(user_gpu),
+                "project_gpu": dict(project_gpu),
+            })
+            
+        except QzAPIError as e:
+            if "401" in str(e) or "过期" in str(e):
+                display.print_error("Cookie 已过期，请重新设置: qzcli login")
+                return 1
+            display.print_warning(f"查询 {ws_name or workspace_id} 失败: {e}")
+            continue
+    
+    if not all_stats:
+        display.print("[dim]暂无运行中的任务[/dim]")
+        return 0
+    
+    # 显示结果
+    for stats in all_stats:
+        ws_name = stats["workspace_name"] or stats["workspace_id"]
+        display.print(f"\n[bold]{ws_name}[/bold]")
+        display.print(f"运行中: {stats['total_tasks']} 个任务, 共 {stats['total_gpu']} GPU\n")
+        
+        # GPU 卡数分布
+        display.print("[bold]GPU 卡数分布:[/bold]")
+        gpu_dist = stats["gpu_distribution"]
+        for gpu_count in sorted(gpu_dist.keys()):
+            task_count = gpu_dist[gpu_count]
+            bar = "█" * min(task_count, 30)
+            display.print(f"  {gpu_count:>3} GPU: {task_count:>3} 任务 {bar}")
+        
+        # 按用户统计（可选）
+        if args.by_user:
+            display.print("\n[bold]按用户统计:[/bold]")
+            user_gpu = stats["user_gpu"]
+            for user, gpu in sorted(user_gpu.items(), key=lambda x: -x[1]):
+                display.print(f"  {user:<12} {gpu:>4} GPU")
+        
+        # 按项目统计（可选）
+        if args.by_project:
+            display.print("\n[bold]按项目统计:[/bold]")
+            project_gpu = stats["project_gpu"]
+            for project, gpu in sorted(project_gpu.items(), key=lambda x: -x[1]):
+                proj_display = project[:25] if len(project) > 25 else project
+                display.print(f"  {proj_display:<27} {gpu:>4} GPU")
+        
+        display.print("")
+    
+    # 汇总
+    if len(all_stats) > 1:
+        total_tasks = sum(s["total_tasks"] for s in all_stats)
+        total_gpu = sum(s["total_gpu"] for s in all_stats)
+        display.print(f"[bold]总计: {total_tasks} 个任务, {total_gpu} GPU[/bold]")
     
     return 0
 
@@ -1212,6 +1424,12 @@ def main():
     avail_parser.add_argument("--export", "-e", action="store_true", help="输出可用于脚本的环境变量格式")
     avail_parser.add_argument("--verbose", "-v", action="store_true", help="显示空闲节点名称列表")
     
+    # usage 命令
+    usage_parser = subparsers.add_parser("usage", help="统计工作空间的 GPU 使用分布")
+    usage_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称")
+    usage_parser.add_argument("--by-user", "-u", action="store_true", help="按用户统计 GPU 使用")
+    usage_parser.add_argument("--by-project", "-p", action="store_true", help="按项目统计 GPU 使用")
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -1243,6 +1461,7 @@ def main():
         "res": cmd_workspaces,
         "avail": cmd_avail,
         "av": cmd_avail,
+        "usage": cmd_usage,
     }
     
     cmd_func = commands.get(args.command)
