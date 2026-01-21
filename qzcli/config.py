@@ -5,7 +5,7 @@
 import os
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 # 默认配置
 DEFAULT_CONFIG = {
@@ -148,3 +148,182 @@ def clear_cookie() -> None:
     """清除 cookie"""
     if COOKIE_FILE.exists():
         COOKIE_FILE.unlink()
+
+
+# 资源缓存文件
+RESOURCES_FILE = CONFIG_DIR / "resources.json"
+
+
+def save_resources(workspace_id: str, resources: Dict[str, Any], name: str = "") -> None:
+    """
+    保存工作空间的资源配置到本地缓存
+    
+    Args:
+        workspace_id: 工作空间 ID
+        resources: 资源配置（projects, compute_groups, specs）
+        name: 工作空间名称（可选）
+    """
+    ensure_config_dir()
+    
+    import time
+    
+    # 读取现有缓存
+    all_resources = load_all_resources()
+    
+    # 更新该工作空间的资源
+    all_resources[workspace_id] = {
+        "id": workspace_id,
+        "name": name or all_resources.get(workspace_id, {}).get("name", ""),
+        "projects": {p["id"]: p for p in resources.get("projects", [])},
+        "compute_groups": {g["id"]: g for g in resources.get("compute_groups", [])},
+        "specs": {s["id"]: s for s in resources.get("specs", [])},
+        "updated_at": time.time(),
+    }
+    
+    with open(RESOURCES_FILE, "w", encoding="utf-8") as f:
+        json.dump(all_resources, f, indent=2, ensure_ascii=False)
+
+
+def load_all_resources() -> Dict[str, Any]:
+    """加载所有工作空间的资源缓存"""
+    if not RESOURCES_FILE.exists():
+        return {}
+    
+    try:
+        with open(RESOURCES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def get_workspace_resources(workspace_id: str) -> Optional[Dict[str, Any]]:
+    """
+    获取指定工作空间的资源缓存
+    
+    Args:
+        workspace_id: 工作空间 ID
+        
+    Returns:
+        资源配置字典，或 None（未缓存）
+    """
+    all_resources = load_all_resources()
+    return all_resources.get(workspace_id)
+
+
+def set_workspace_name(workspace_id: str, name: str) -> bool:
+    """
+    设置工作空间的名称（别名）
+    
+    Args:
+        workspace_id: 工作空间 ID
+        name: 名称
+        
+    Returns:
+        是否成功
+    """
+    all_resources = load_all_resources()
+    
+    if workspace_id not in all_resources:
+        # 创建一个空的工作空间条目
+        import time
+        all_resources[workspace_id] = {
+            "id": workspace_id,
+            "name": name,
+            "projects": {},
+            "compute_groups": {},
+            "specs": {},
+            "updated_at": time.time(),
+        }
+    else:
+        all_resources[workspace_id]["name"] = name
+    
+    ensure_config_dir()
+    with open(RESOURCES_FILE, "w", encoding="utf-8") as f:
+        json.dump(all_resources, f, indent=2, ensure_ascii=False)
+    
+    return True
+
+
+def find_workspace_by_name(name: str) -> Optional[str]:
+    """
+    通过名称查找工作空间 ID
+    
+    Args:
+        name: 工作空间名称（支持模糊匹配）
+        
+    Returns:
+        工作空间 ID，或 None
+    """
+    all_resources = load_all_resources()
+    
+    # 精确匹配优先
+    for ws_id, ws_data in all_resources.items():
+        if ws_data.get("name", "") == name:
+            return ws_id
+    
+    # 模糊匹配
+    for ws_id, ws_data in all_resources.items():
+        if name.lower() in ws_data.get("name", "").lower():
+            return ws_id
+    
+    return None
+
+
+def find_resource_by_name(
+    workspace_id: str,
+    resource_type: str,
+    name: str
+) -> Optional[Dict[str, Any]]:
+    """
+    通过名称查找资源（项目、计算组、规格）
+    
+    Args:
+        workspace_id: 工作空间 ID
+        resource_type: 资源类型 (projects, compute_groups, specs)
+        name: 资源名称（支持模糊匹配）
+        
+    Returns:
+        资源配置字典，或 None
+    """
+    ws_resources = get_workspace_resources(workspace_id)
+    if not ws_resources:
+        return None
+    
+    resources = ws_resources.get(resource_type, {})
+    
+    # 精确匹配优先
+    for res_id, res_data in resources.items():
+        res_name = res_data.get("name", "")
+        if res_name == name:
+            return res_data
+    
+    # 模糊匹配
+    for res_id, res_data in resources.items():
+        res_name = res_data.get("name", "")
+        if name.lower() in res_name.lower():
+            return res_data
+    
+    return None
+
+
+def list_cached_workspaces() -> List[Dict[str, Any]]:
+    """
+    列出所有已缓存的工作空间
+    
+    Returns:
+        工作空间列表 [{id, name, updated_at, ...}, ...]
+    """
+    all_resources = load_all_resources()
+    result = []
+    
+    for ws_id, ws_data in all_resources.items():
+        result.append({
+            "id": ws_id,
+            "name": ws_data.get("name", ""),
+            "updated_at": ws_data.get("updated_at", 0),
+            "project_count": len(ws_data.get("projects", {})),
+            "compute_group_count": len(ws_data.get("compute_groups", {})),
+            "spec_count": len(ws_data.get("specs", {})),
+        })
+    
+    return result

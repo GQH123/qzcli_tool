@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Optional, List
 
 from . import __version__
-from .config import init_config, get_credentials, load_config, CONFIG_DIR, save_cookie, get_cookie, clear_cookie
+from .config import (
+    init_config, get_credentials, load_config, CONFIG_DIR, 
+    save_cookie, get_cookie, clear_cookie,
+    save_resources, get_workspace_resources, load_all_resources,
+    set_workspace_name, find_workspace_by_name, find_resource_by_name,
+    list_cached_workspaces,
+)
 from .api import get_api, QzAPIError
 from .store import get_store, JobRecord
 from .display import get_display, format_duration, format_time_ago
@@ -47,8 +53,136 @@ def cmd_init(args):
         return 1
 
 
+def cmd_list_cookie(args):
+    """使用 cookie 从 API 获取任务列表"""
+    display = get_display()
+    api = get_api()
+    
+    # 获取 cookie
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        display.print_error("未设置 cookie，请先运行: qzcli cookie -f cookies.txt")
+        return 1
+    
+    cookie = cookie_data["cookie"]
+    
+    # 确定要查询的工作空间列表
+    workspace_input = args.workspace
+    
+    if args.all_ws:
+        # 查询所有已缓存的工作空间
+        all_resources = load_all_resources()
+        if not all_resources:
+            display.print_error("没有已缓存的工作空间")
+            display.print("[dim]请先运行: qzcli res -w <workspace_id> -u[/dim]")
+            return 1
+        workspace_ids = [(ws_id, data.get("name", "")) for ws_id, data in all_resources.items()]
+    elif workspace_input:
+        # 指定的工作空间
+        if workspace_input.startswith("ws-"):
+            workspace_id = workspace_input
+            ws_resources = get_workspace_resources(workspace_id)
+            ws_name = ws_resources.get("name", "") if ws_resources else ""
+        else:
+            workspace_id = find_workspace_by_name(workspace_input)
+            if workspace_id:
+                ws_resources = get_workspace_resources(workspace_id)
+                ws_name = ws_resources.get("name", "") if ws_resources else workspace_input
+            else:
+                display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
+                display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
+                return 1
+        workspace_ids = [(workspace_id, ws_name)]
+    else:
+        # 使用默认工作空间
+        default_ws = cookie_data.get("workspace_id", "")
+        if not default_ws:
+            display.print_error("请指定工作空间: qzcli ls -c -w <名称或ID>")
+            display.print("[dim]或使用 --all-ws 查询所有已缓存的工作空间[/dim]")
+            return 1
+        ws_resources = get_workspace_resources(default_ws)
+        ws_name = ws_resources.get("name", "") if ws_resources else ""
+        workspace_ids = [(default_ws, ws_name)]
+    
+    all_jobs = []
+    
+    for workspace_id, ws_name in workspace_ids:
+        try:
+            if len(workspace_ids) > 1:
+                display.print(f"[dim]正在获取 {ws_name or workspace_id} 的任务...[/dim]")
+            else:
+                display.print(f"[dim]正在从 API 获取任务列表...[/dim]")
+            
+            result = api.list_jobs_with_cookie(
+                workspace_id, 
+                cookie, 
+                page_size=args.limit * 2 if args.running else args.limit
+            )
+            
+            jobs_data = result.get("jobs", [])
+            
+            # 转换为 JobRecord 格式
+            for job_data in jobs_data:
+                job = JobRecord.from_api_response(job_data, source="api_cookie")
+                # 添加工作空间名称
+                if ws_name:
+                    job.metadata["workspace_name"] = ws_name
+                all_jobs.append(job)
+                
+        except QzAPIError as e:
+            if "401" in str(e) or "过期" in str(e):
+                display.print_error("Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>")
+                return 1
+            display.print_warning(f"获取 {ws_name or workspace_id} 失败: {e}")
+            continue
+    
+    if not all_jobs:
+        display.print("[dim]暂无任务[/dim]")
+        return 0
+    
+    # 按创建时间排序
+    all_jobs.sort(key=lambda x: x.created_at or "", reverse=True)
+    
+    # 过滤状态
+    if args.status:
+        all_jobs = [j for j in all_jobs if args.status.lower() in j.status.lower()]
+    
+    # 过滤运行中的任务
+    if args.running:
+        active_statuses = {"job_running", "job_queuing", "job_pending", "running", "queuing", "pending"}
+        all_jobs = [
+            j for j in all_jobs
+            if j.status.lower() in active_statuses or "running" in j.status.lower() or "queue" in j.status.lower()
+        ]
+    
+    # 限制数量
+    all_jobs = all_jobs[:args.limit]
+    
+    if not all_jobs:
+        display.print("[dim]暂无符合条件的任务[/dim]")
+        return 0
+    
+    # 显示标题
+    if len(workspace_ids) == 1:
+        ws_name = workspace_ids[0][1]
+        if ws_name:
+            display.print(f"\n[bold]工作空间: {ws_name}[/bold]\n")
+    
+    # 复用现有显示函数
+    if args.wide and not args.compact:
+        display.print_jobs_wide(all_jobs)
+    else:
+        display.print_jobs_table(all_jobs, show_command=args.verbose, show_url=args.url)
+    
+    return 0
+
+
 def cmd_list(args):
     """列出任务"""
+    # Cookie 模式：从 API 获取任务
+    if args.cookie:
+        return cmd_list_cookie(args)
+    
     display = get_display()
     store = get_store()
     api = get_api()
@@ -380,12 +514,12 @@ def cmd_cookie(args):
         display.print_error("cookie 不能为空")
         return 1
     
-    # 测试 cookie 是否有效
+    # 测试 cookie 是否有效（使用 /openapi/v1/train_job/list 端点）
     if not args.no_test and workspace_id:
         display.print("正在验证 cookie...")
         api = get_api()
         try:
-            result = api.list_workspace_tasks(workspace_id, cookie)
+            result = api.list_jobs_with_cookie(workspace_id, cookie, page_size=1)
             total = result.get("total", 0)
             display.print_success(f"Cookie 有效！工作空间内有 {total} 个任务")
         except QzAPIError as e:
@@ -397,6 +531,377 @@ def cmd_cookie(args):
     return 0
 
 
+def cmd_workspaces(args):
+    """从历史任务中提取工作空间和资源配置（支持本地缓存）"""
+    display = get_display()
+    api = get_api()
+    
+    # 如果是列出所有已缓存的工作空间
+    if args.list:
+        cached = list_cached_workspaces()
+        if not cached:
+            display.print("[dim]暂无已缓存的工作空间，使用 qzcli res -w <workspace_id> 添加[/dim]")
+            return 0
+        
+        display.print(f"\n[bold]已缓存的工作空间 ({len(cached)} 个)[/bold]\n")
+        for ws in cached:
+            name = ws.get("name") or "[未命名]"
+            import datetime
+            updated = datetime.datetime.fromtimestamp(ws.get("updated_at", 0)).strftime("%Y-%m-%d %H:%M")
+            display.print(f"  [bold]{name}[/bold]")
+            display.print(f"    ID: [cyan]{ws['id']}[/cyan]")
+            display.print(f"    资源: {ws['project_count']} 项目, {ws['compute_group_count']} 计算组, {ws['spec_count']} 规格")
+            display.print(f"    更新: {updated}")
+            display.print("")
+        
+        display.print("[dim]使用方法:[/dim]")
+        display.print("  qzcli res -w <名称或ID>      # 查看资源")
+        display.print("  qzcli res -w <ID> -u         # 更新缓存")
+        display.print("  qzcli res -w <ID> --name 别名  # 设置名称")
+        return 0
+    
+    # 如果只设置名称（没有 -u 参数）
+    if hasattr(args, 'name') and args.name and not args.update:
+        workspace_id = args.workspace
+        if not workspace_id:
+            display.print_error("请指定工作空间 ID: qzcli res -w <workspace_id> --name <名称>")
+            return 1
+        set_workspace_name(workspace_id, args.name)
+        display.print_success(f"已设置工作空间名称: {args.name}")
+        return 0
+    
+    # 记录要设置的名称（如果有）
+    pending_name = args.name if hasattr(args, 'name') else None
+    
+    # 解析 workspace 参数（支持名称或 ID）
+    workspace_input = args.workspace
+    cookie_data = get_cookie()
+    
+    if not workspace_input:
+        workspace_id = cookie_data.get("workspace_id", "") if cookie_data else ""
+    elif workspace_input.startswith("ws-"):
+        workspace_id = workspace_input
+    else:
+        # 尝试通过名称查找
+        workspace_id = find_workspace_by_name(workspace_input)
+        if workspace_id:
+            display.print(f"[dim]匹配到工作空间: {workspace_input} -> {workspace_id}[/dim]")
+        else:
+            display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
+            display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
+            return 1
+    
+    if not workspace_id:
+        display.print_error("请指定工作空间: qzcli res -w <名称或ID>")
+        display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
+        return 1
+    
+    # 检查是否需要从 API 更新
+    cached_resources = get_workspace_resources(workspace_id)
+    use_cache = cached_resources and not args.update
+    
+    if use_cache:
+        # 使用缓存
+        import datetime
+        updated = datetime.datetime.fromtimestamp(cached_resources.get("updated_at", 0)).strftime("%Y-%m-%d %H:%M")
+        ws_name = cached_resources.get("name", "")
+        title = f"资源配置"
+        if ws_name:
+            title += f" [{ws_name}]"
+        title += f" (缓存于 {updated})"
+        
+        display.print(f"\n[bold]{title}[/bold]")
+        display.print(f"[dim]工作空间: {workspace_id}[/dim]\n")
+        
+        # 转换缓存格式为列表格式
+        projects = list(cached_resources.get("projects", {}).values())
+        compute_groups = list(cached_resources.get("compute_groups", {}).values())
+        specs = list(cached_resources.get("specs", {}).values())
+    else:
+        # 从 API 获取
+        if not cookie_data or not cookie_data.get("cookie"):
+            display.print_error("未设置 cookie，请先运行: qzcli cookie -f cookies.txt")
+            display.print("[dim]提示: 从浏览器 F12 获取 cookie[/dim]")
+            return 1
+        
+        cookie = cookie_data["cookie"]
+        
+        try:
+            display.print("[dim]正在从历史任务中提取资源配置...[/dim]")
+            
+            # 获取任务列表
+            result = api.list_jobs_with_cookie(workspace_id, cookie, page_size=200)
+            jobs = result.get("jobs", [])
+            total = result.get("total", 0)
+            
+            if not jobs:
+                display.print("未找到任务记录")
+                return 0
+            
+            # 提取资源信息
+            resources = api.extract_resources_from_jobs(jobs)
+            
+            # 保存到本地缓存
+            ws_name = pending_name or (cached_resources.get("name", "") if cached_resources else "")
+            save_resources(workspace_id, resources, ws_name)
+            display.print_success("资源配置已保存到本地缓存")
+            
+            display.print(f"\n[bold]资源配置（从 {len(jobs)}/{total} 个任务中提取）[/bold]")
+            display.print(f"[dim]工作空间: {workspace_id}[/dim]\n")
+            
+            projects = resources.get("projects", [])
+            compute_groups = resources.get("compute_groups", [])
+            specs = resources.get("specs", [])
+            
+        except QzAPIError as e:
+            if "401" in str(e) or "过期" in str(e):
+                display.print_error("Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>")
+            else:
+                display.print_error(f"获取失败: {e}")
+            return 1
+    
+    # 显示项目
+    if projects:
+        display.print(f"[bold]项目 ({len(projects)} 个)[/bold]")
+        for proj in projects:
+            display.print(f"  - {proj['name']}")
+            display.print(f"    [cyan]{proj['id']}[/cyan]")
+        display.print("")
+    
+    # 显示计算组
+    if compute_groups:
+        display.print(f"[bold]计算组 ({len(compute_groups)} 个)[/bold]")
+        for group in compute_groups:
+            gpu_type = group.get("gpu_type", "")
+            gpu_display = group.get("gpu_type_display", "")
+            display.print(f"  - {group['name']} [{gpu_type}]")
+            if gpu_display:
+                display.print(f"    [dim]{gpu_display}[/dim]")
+            display.print(f"    [cyan]{group['id']}[/cyan]")
+        display.print("")
+    
+    # 显示规格
+    if specs:
+        display.print(f"[bold]GPU 规格 ({len(specs)} 个)[/bold]")
+        for spec in specs:
+            gpu_type = spec.get("gpu_type", "")
+            gpu_count = spec.get("gpu_count", 0)
+            cpu_count = spec.get("cpu_count", 0)
+            mem_gb = spec.get("memory_gb", 0)
+            display.print(f"  - {gpu_count}x {gpu_type} + {cpu_count}核CPU + {mem_gb}GB内存")
+            display.print(f"    [cyan]{spec['id']}[/cyan]")
+        display.print("")
+    
+    # 导出格式
+    if args.export:
+        display.print("[bold]导出格式（可用于 shell 脚本）:[/bold]")
+        display.print(f'WORKSPACE_ID="{workspace_id}"')
+        if projects:
+            display.print(f'PROJECT_ID="{projects[0]["id"]}"  # {projects[0]["name"]}')
+        if compute_groups:
+            for group in compute_groups:
+                display.print(f'# {group["name"]} [{group.get("gpu_type", "")}]')
+                display.print(f'LOGIC_COMPUTE_GROUP_ID="{group["id"]}"')
+        if specs:
+            for spec in specs:
+                display.print(f'# {spec.get("gpu_count", 0)}x {spec.get("gpu_type", "")}')
+                display.print(f'SPEC_ID="{spec["id"]}"')
+    
+    return 0
+
+
+def cmd_resources(args):
+    """列出工作空间内可用的计算资源（cmd_workspaces 的别名）"""
+    # 直接调用 workspaces 命令
+    return cmd_workspaces(args)
+
+
+def cmd_avail(args):
+    """查询计算组空余节点，帮助决定任务应该提交到哪里"""
+    display = get_display()
+    api = get_api()
+    
+    # 获取 cookie
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        display.print_error("未设置 cookie，请先运行: qzcli cookie -f cookies.txt")
+        return 1
+    
+    cookie = cookie_data["cookie"]
+    
+    # 解析 workspace 参数（支持名称或 ID）
+    workspace_input = args.workspace
+    
+    # 如果不指定 workspace，查询所有已缓存的工作空间
+    if not workspace_input:
+        all_resources = load_all_resources()
+        if not all_resources:
+            display.print_error("没有已缓存的工作空间")
+            display.print("[dim]请先运行: qzcli res -w <workspace_id> -u[/dim]")
+            return 1
+        workspace_ids = list(all_resources.keys())
+    elif workspace_input.startswith("ws-"):
+        workspace_ids = [workspace_input]
+    else:
+        workspace_id = find_workspace_by_name(workspace_input)
+        if workspace_id:
+            workspace_ids = [workspace_id]
+            display.print(f"[dim]匹配到工作空间: {workspace_input} -> {workspace_id}[/dim]")
+        else:
+            display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
+            display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
+            return 1
+    
+    required_nodes = args.nodes
+    group_filter = args.group
+    all_results = []  # 所有工作空间的结果汇总
+    
+    for workspace_id in workspace_ids:
+        # 获取计算组列表（从缓存）
+        cached_resources = get_workspace_resources(workspace_id)
+        if not cached_resources:
+            display.print_warning(f"未缓存工作空间 {workspace_id} 的资源信息，跳过")
+            continue
+        
+        compute_groups = cached_resources.get("compute_groups", {})
+        specs = cached_resources.get("specs", {})
+        ws_name = cached_resources.get("name", "") or workspace_id
+        
+        # 如果指定了特定计算组
+        if group_filter:
+            if group_filter.startswith("lcg-"):
+                if group_filter in compute_groups:
+                    compute_groups = {group_filter: compute_groups[group_filter]}
+                else:
+                    continue  # 该工作空间没有这个计算组
+            else:
+                found = find_resource_by_name(workspace_id, "compute_groups", group_filter)
+                if found:
+                    compute_groups = {found["id"]: found}
+                else:
+                    continue
+        
+        if not compute_groups:
+            continue
+        
+        display.print(f"[dim]正在查询 {ws_name} 的 {len(compute_groups)} 个计算组...[/dim]")
+        
+        try:
+            for lcg_id, lcg_info in compute_groups.items():
+                lcg_name = lcg_info.get("name", lcg_id)
+                gpu_type = lcg_info.get("gpu_type", "")
+                
+                try:
+                    data = api.list_node_dimension(workspace_id, cookie, lcg_id, page_size=200)
+                    nodes = data.get("node_dimensions", [])
+                    total_nodes = len(nodes)
+                    
+                    # 统计空闲节点（GPU 使用数为 0）
+                    free_nodes = []
+                    for node in nodes:
+                        gpu_info = node.get("gpu", {})
+                        gpu_used = gpu_info.get("used", 0)
+                        gpu_total = gpu_info.get("total", 0)
+                        if gpu_used == 0 and gpu_total > 0:
+                            free_nodes.append({
+                                "name": node.get("name", ""),
+                                "gpu_total": gpu_total,
+                            })
+                    
+                    all_results.append({
+                        "workspace_id": workspace_id,
+                        "workspace_name": ws_name,
+                        "id": lcg_id,
+                        "name": lcg_name,
+                        "gpu_type": gpu_type,
+                        "total_nodes": total_nodes,
+                        "free_nodes": len(free_nodes),
+                        "free_node_list": free_nodes,
+                        "specs": specs,
+                    })
+                except QzAPIError as e:
+                    display.print_warning(f"查询 {lcg_name} 失败: {e}")
+                    continue
+        except QzAPIError as e:
+            if "401" in str(e) or "过期" in str(e):
+                display.print_error("Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>")
+                return 1
+            display.print_warning(f"查询 {ws_name} 失败: {e}")
+            continue
+    
+    if not all_results:
+        display.print_error("未能获取任何计算组的节点信息")
+        return 1
+    
+    display.print(f"\n[bold]空余节点汇总[/bold]\n")
+    
+    # 如果指定了节点需求，过滤并推荐
+    if required_nodes:
+        # 按空闲节点数降序排序（跨工作空间）
+        all_results.sort(key=lambda x: x["free_nodes"], reverse=True)
+        available = [r for r in all_results if r["free_nodes"] >= required_nodes]
+        
+        if not available:
+            display.print(f"[red]没有计算组有 >= {required_nodes} 个空闲节点[/red]\n")
+            display.print("当前各计算组空闲节点数：")
+            for r in all_results:
+                display.print(f"  [{r['workspace_name']}] {r['name']}: {r['free_nodes']} 空节点 [{r['gpu_type']}]")
+            return 1
+        
+        display.print(f"需要 {required_nodes} 个节点，以下计算组可用：\n")
+        
+        for r in available:
+            display.print(f"[green]✓[/green] [{r['workspace_name']}] [bold]{r['name']}[/bold]  {r['free_nodes']} 空节点 [{r['gpu_type']}]")
+            display.print(f"  [cyan]{r['id']}[/cyan]")
+            # 显示空闲节点列表
+            if args.verbose and r.get('free_node_list'):
+                node_names = [n['name'] for n in r['free_node_list']]
+                display.print(f"  [dim]空闲节点: {', '.join(node_names)}[/dim]")
+        
+        # 导出格式
+        if args.export:
+            display.print("")
+            best = available[0]
+            display.print(f"# 推荐: [{best['workspace_name']}] {best['name']} ({best['free_nodes']} 空节点)")
+            display.print(f'WORKSPACE_ID="{best["workspace_id"]}"')
+            display.print(f'LOGIC_COMPUTE_GROUP_ID="{best["id"]}"')
+            specs = best.get("specs", {})
+            if specs:
+                spec = list(specs.values())[0]
+                display.print(f'SPEC_ID="{spec["id"]}"  # {spec.get("gpu_count", 0)}x {spec.get("gpu_type", "")}')
+    else:
+        # 按工作空间分组，组内按空闲节点数降序
+        from collections import defaultdict
+        by_workspace = defaultdict(list)
+        for r in all_results:
+            by_workspace[r['workspace_name']].append(r)
+        
+        for ws_name, results in by_workspace.items():
+            results.sort(key=lambda x: x["free_nodes"], reverse=True)
+            display.print(f"[bold]{ws_name}[/bold]")
+            display.print(f"{'  计算组':<27} {'空节点':>6} {'总节点':>6} {'GPU类型':<10}")
+            display.print("  " + "-" * 53)
+            for r in results:
+                name_display = r['name'][:23] if len(r['name']) > 23 else r['name']
+                display.print(f"  {name_display:<25} {r['free_nodes']:>6} {r['total_nodes']:>6} {r['gpu_type']:<10}")
+                # 显示空闲节点列表
+                if args.verbose and r.get('free_node_list'):
+                    node_names = [n['name'] for n in r['free_node_list']]
+                    display.print(f"    [dim]空闲: {', '.join(node_names)}[/dim]")
+            display.print("")
+        
+        # 导出格式
+        if args.export:
+            display.print("[bold]导出格式:[/bold]")
+            for r in sorted(all_results, key=lambda x: x["free_nodes"], reverse=True):
+                if r['free_nodes'] > 0:
+                    display.print(f"# [{r['workspace_name']}] {r['name']} ({r['free_nodes']} 空节点)")
+                    display.print(f'WORKSPACE_ID="{r["workspace_id"]}"')
+                    display.print(f'LOGIC_COMPUTE_GROUP_ID="{r["id"]}"')
+    
+    return 0
+
+
 def cmd_workspace(args):
     """查看工作空间内所有运行任务"""
     display = get_display()
@@ -405,15 +910,33 @@ def cmd_workspace(args):
     # 获取 cookie
     cookie_data = get_cookie()
     if not cookie_data or not cookie_data.get("cookie"):
-        display.print_error("未设置 cookie，请先运行: qzcli cookie --workspace <workspace_id>")
+        display.print_error("未设置 cookie，请先运行: qzcli cookie -f cookies.txt")
         display.print("[dim]提示: 从浏览器 F12 获取 cookie[/dim]")
         return 1
     
     cookie = cookie_data["cookie"]
     workspace_id = args.workspace or cookie_data.get("workspace_id", "")
     
+    # 如果没有指定 workspace，列出可用的 workspace 供选择
     if not workspace_id:
-        display.print_error("请指定工作空间 ID: qzcli workspace --workspace <id>")
+        display.print("[yellow]未设置默认工作空间，正在获取可用列表...[/yellow]\n")
+        try:
+            workspaces = api.list_workspaces(cookie)
+            if workspaces:
+                display.print("[bold]请选择一个工作空间:[/bold]\n")
+                for idx, ws in enumerate(workspaces, 1):
+                    ws_id = ws.get("id", "")
+                    ws_name = ws.get("name", "未命名")
+                    display.print(f"  [{idx}] {ws_name}")
+                    display.print(f"      [dim]{ws_id}[/dim]")
+                display.print("")
+                display.print("[dim]使用方法:[/dim]")
+                display.print("  qzcli ws -w <workspace_id>")
+                display.print("  qzcli cookie -w <workspace_id>  # 设置默认")
+            else:
+                display.print_error("未找到可访问的工作空间")
+        except QzAPIError as e:
+            display.print_error(f"获取工作空间列表失败: {e}")
         return 1
     
     # 项目过滤
@@ -519,6 +1042,63 @@ def cmd_workspace(args):
         return 1
 
 
+def cmd_login(args):
+    """通过 CAS 登录获取 cookie"""
+    import getpass
+    
+    display = get_display()
+    api = get_api()
+    
+    # 获取用户名
+    username = args.username
+    if not username:
+        try:
+            username = input("学工号: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            display.print("\n[dim]已取消[/dim]")
+            return 1
+    
+    if not username:
+        display.print_error("用户名不能为空")
+        return 1
+    
+    # 获取密码
+    password = args.password
+    if not password:
+        try:
+            password = getpass.getpass("密码: ")
+        except (EOFError, KeyboardInterrupt):
+            display.print("\n[dim]已取消[/dim]")
+            return 1
+    
+    if not password:
+        display.print_error("密码不能为空")
+        return 1
+    
+    display.print("[dim]正在登录...[/dim]")
+    
+    try:
+        cookie = api.login_with_cas(username, password)
+        
+        # 保存 cookie
+        save_cookie(cookie, workspace_id=args.workspace)
+        
+        display.print_success("登录成功！Cookie 已保存")
+        
+        # 显示 cookie 前几个字符
+        cookie_preview = cookie[:50] + "..." if len(cookie) > 50 else cookie
+        display.print(f"[dim]Cookie: {cookie_preview}[/dim]")
+        
+        if args.workspace:
+            display.print(f"[dim]默认工作空间: {args.workspace}[/dim]")
+        
+        return 0
+        
+    except QzAPIError as e:
+        display.print_error(f"登录失败: {e}")
+        return 1
+
+
 def main():
     """主入口"""
     parser = argparse.ArgumentParser(
@@ -546,8 +1126,12 @@ def main():
     list_parser.add_argument("--no-refresh", action="store_true", help="不更新状态")
     list_parser.add_argument("--verbose", "-v", action="store_true", help="显示详细信息")
     list_parser.add_argument("--url", "-u", action="store_true", default=True, help="显示任务链接（默认开启）")
-    list_parser.add_argument("--wide", "-w", action="store_true", default=True, help="宽格式显示（默认开启）")
-    list_parser.add_argument("--compact", "-c", action="store_true", help="紧凑表格格式（关闭宽格式）")
+    list_parser.add_argument("--wide", action="store_true", default=True, help="宽格式显示（默认开启）")
+    list_parser.add_argument("--compact", action="store_true", help="紧凑表格格式（关闭宽格式）")
+    # Cookie 模式参数
+    list_parser.add_argument("--cookie", "-c", action="store_true", help="使用 cookie 从 API 获取任务（无需本地 store）")
+    list_parser.add_argument("--workspace", "-w", help="工作空间（名称或 ID，cookie 模式）")
+    list_parser.add_argument("--all-ws", action="store_true", help="查询所有已缓存的工作空间（cookie 模式）")
     
     # status 命令
     status_parser = subparsers.add_parser("status", aliases=["st"], help="查看任务状态")
@@ -597,6 +1181,12 @@ def main():
     cookie_parser.add_argument("--clear", action="store_true", help="清除 cookie")
     cookie_parser.add_argument("--no-test", action="store_true", help="不测试 cookie 有效性")
     
+    # login 命令
+    login_parser = subparsers.add_parser("login", help="通过 CAS 统一认证登录获取 cookie")
+    login_parser.add_argument("--username", "-u", help="学工号")
+    login_parser.add_argument("--password", "-p", help="密码")
+    login_parser.add_argument("--workspace", "-w", help="默认工作空间 ID")
+    
     # workspace 命令
     workspace_parser = subparsers.add_parser("workspace", aliases=["ws"], help="查看工作空间内所有运行任务")
     workspace_parser.add_argument("--workspace", "-w", help="工作空间 ID")
@@ -605,6 +1195,22 @@ def main():
     workspace_parser.add_argument("--page", type=int, default=1, help="页码")
     workspace_parser.add_argument("--size", type=int, default=100, help="每页数量（默认 100）")
     workspace_parser.add_argument("--sync", "-s", action="store_true", help="同步到本地任务列表")
+    
+    # workspaces 命令 - 从历史任务提取资源配置
+    workspaces_parser = subparsers.add_parser("workspaces", aliases=["lsws", "res", "resources"], help="从历史任务提取资源配置（项目、计算组、规格）")
+    workspaces_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称")
+    workspaces_parser.add_argument("--export", "-e", action="store_true", help="输出可用于脚本的环境变量格式")
+    workspaces_parser.add_argument("--update", "-u", action="store_true", help="强制从 API 更新缓存")
+    workspaces_parser.add_argument("--list", "-l", action="store_true", help="列出所有已缓存的工作空间")
+    workspaces_parser.add_argument("--name", help="设置工作空间名称（别名）")
+    
+    # avail 命令 - 查询空余节点
+    avail_parser = subparsers.add_parser("avail", aliases=["av"], help="查询计算组空余节点，帮助决定任务应该提交到哪里")
+    avail_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称")
+    avail_parser.add_argument("--group", "-g", help="计算组 ID 或名称（可选，不指定则查询所有）")
+    avail_parser.add_argument("--nodes", "-n", type=int, help="需要的节点数（推荐模式：找出满足条件的计算组）")
+    avail_parser.add_argument("--export", "-e", action="store_true", help="输出可用于脚本的环境变量格式")
+    avail_parser.add_argument("--verbose", "-v", action="store_true", help="显示空闲节点名称列表")
     
     args = parser.parse_args()
     
@@ -628,8 +1234,15 @@ def main():
         "rm": cmd_remove,
         "clear": cmd_clear,
         "cookie": cmd_cookie,
+        "login": cmd_login,
         "workspace": cmd_workspace,
         "ws": cmd_workspace,
+        "workspaces": cmd_workspaces,
+        "lsws": cmd_workspaces,
+        "resources": cmd_workspaces,
+        "res": cmd_workspaces,
+        "avail": cmd_avail,
+        "av": cmd_avail,
     }
     
     cmd_func = commands.get(args.command)

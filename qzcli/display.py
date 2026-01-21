@@ -268,6 +268,9 @@ class Display:
                 gpu_info_parts.append(f"{job.gpu_count}×{job.gpu_type}")
             elif job.gpu_count:
                 gpu_info_parts.append(f"{job.gpu_count} GPU")
+            # 显示节点数（大于1时显示）
+            if job.instance_count and job.instance_count > 1:
+                gpu_info_parts.append(f"{job.instance_count}节点")
             if job.compute_group_name:
                 gpu_info_parts.append(job.compute_group_name)
             gpu_info_line = " | ".join(gpu_info_parts) if gpu_info_parts else ""
