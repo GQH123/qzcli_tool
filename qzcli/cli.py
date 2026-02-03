@@ -836,6 +836,8 @@ def cmd_avail(args):
                     
                     for node in nodes:
                         node_name = node.get("name", "")
+                        node_status = node.get("status", "")
+                        cordon_type = node.get("cordon_type", "")
                         gpu_info = node.get("gpu", {})
                         gpu_used = gpu_info.get("used", 0)
                         gpu_total = gpu_info.get("total", 0)
@@ -844,29 +846,37 @@ def cmd_avail(args):
                         if gpu_total == 0:
                             continue
                         
+                        # 判断节点是否可调度
+                        # - 状态必须是 Ready
+                        # - 不能有 cordon 标记（hardware-fault, software-fault 等）
+                        is_schedulable = (node_status == "Ready" and not cordon_type)
+                        
                         gpu_free = max(0, gpu_total - gpu_used)  # 避免负数
                         
                         total_gpus += gpu_total
-                        total_free_gpus += gpu_free
                         
-                        # 统计空闲 GPU 分布
-                        if gpu_free > 0:
-                            gpu_free_distribution[gpu_free] = gpu_free_distribution.get(gpu_free, 0) + 1
-                        
-                        if gpu_used == 0 and gpu_total > 0:
-                            free_nodes.append({
-                                "name": node_name,
-                                "gpu_total": gpu_total,
-                            })
-                        
-                        # 检查是否为低优空余节点（低优任务占满整节点，>=8卡）
-                        low_priority_gpu = node_low_priority_gpu.get(node_name, 0)
-                        if low_priority_gpu >= 8 and gpu_used > 0:
-                            low_priority_free_nodes.append({
-                                "name": node_name,
-                                "low_priority_gpu": low_priority_gpu,
-                                "gpu_total": gpu_total,
-                            })
+                        # 只有可调度节点的空闲 GPU 才计入统计
+                        if is_schedulable:
+                            total_free_gpus += gpu_free
+                            
+                            # 统计空闲 GPU 分布
+                            if gpu_free > 0:
+                                gpu_free_distribution[gpu_free] = gpu_free_distribution.get(gpu_free, 0) + 1
+                            
+                            if gpu_used == 0 and gpu_total > 0:
+                                free_nodes.append({
+                                    "name": node_name,
+                                    "gpu_total": gpu_total,
+                                })
+                            
+                            # 检查是否为低优空余节点（低优任务占满整节点，>=8卡）
+                            low_priority_gpu = node_low_priority_gpu.get(node_name, 0)
+                            if low_priority_gpu >= 8 and gpu_used > 0:
+                                low_priority_free_nodes.append({
+                                    "name": node_name,
+                                    "low_priority_gpu": low_priority_gpu,
+                                    "gpu_total": gpu_total,
+                                })
                     
                     all_results.append({
                         "workspace_id": workspace_id,
